@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/cvcraft252/llm-gateway/internal/config"
+	"github.com/cvcraft252/llm-gateway/internal/db"
 	"github.com/cvcraft252/llm-gateway/internal/handler"
 	"github.com/cvcraft252/llm-gateway/internal/logger"
 	"github.com/cvcraft252/llm-gateway/internal/middleware"
@@ -24,9 +25,19 @@ func main() {
 	}
 	slog.Info("Configuration loaded successfully", "port", cfg.Server.Port)
 
+	// Initialize SQLite Database
+	database, err := db.Init("gateway.db")
+	if err != nil {
+		slog.Error("Failed to initialize database", "error", err)
+		os.Exit(1)
+	}
+	defer database.Close()
+	slog.Info("Database initialized successfully")
+
 	mux := http.NewServeMux()
 
-	chatHandler := handler.NewChatHandler(cfg)
+	// Pass database connection to chat handler
+	chatHandler := handler.NewChatHandler(cfg, database)
 	authedChatHandler := middleware.Auth(cfg, chatHandler)
 
 	mux.HandleFunc("POST /v1/chat/completions", authedChatHandler)

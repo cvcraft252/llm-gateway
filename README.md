@@ -69,7 +69,7 @@ curl -i -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer gw-key-123456" \
   -d '{
     "model": "deepseek-chat", 
-    "messages": [{"role": "user", "content": "Hello!"}],
+    "messages": [{"role": "user", "content": "Introduce Go language in one sentence"}],
     "stream": true
   }'
 ```

@@ -11,7 +11,12 @@ import (
 	"time"
 
 	"github.com/cvcraft252/llm-gateway/internal/config"
+	"github.com/cvcraft252/llm-gateway/internal/db"
 )
+
+type chatRequest struct {
+	Model string `json:"model"`
+}
 
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
@@ -27,7 +32,7 @@ type nonStreamResponse struct {
 	Usage *Usage `json:"usage"`
 }
 
-func NewChatHandler(cfg *config.Config) http.HandlerFunc {
+func NewChatHandler(cfg *config.Config, database *db.DB) http.HandlerFunc {
 	client := &http.Client{
 		Timeout: 5 * time.Minute,
 	}
@@ -36,8 +41,22 @@ func NewChatHandler(cfg *config.Config) http.HandlerFunc {
 		start := time.Now()
 		slog.Info("Received chat request", "path", r.URL.Path, "method", r.Method)
 
-		upstreamURL := cfg.Upstream.URL + "/chat/completions"
+		// Read and cache body to extract model name
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			slog.Error("Failed to read body", "error", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		r.Body.Close()
 
+		var reqObj chatRequest
+		_ = json.Unmarshal(bodyBytes, &reqObj)
+
+		// Restore r.Body for upstream forwarding
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+		upstreamURL := cfg.Upstream.URL + "/chat/completions"
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, r.Body)
 		if err != nil {
 			slog.Error("Failed to create upstream request", "error", err)
@@ -142,7 +161,18 @@ func NewChatHandler(cfg *config.Config) http.HandlerFunc {
 
 		duration := time.Since(start)
 
+		// Prepare and submit log to SQLite asynchronously
+		audit := &db.AuditLog{
+			Model:      reqObj.Model,
+			StatusCode: resp.StatusCode,
+			IsStream:   isStream,
+			DurationMs: duration.Milliseconds(),
+		}
 		if finalUsage != nil {
+			audit.PromptTokens = finalUsage.PromptTokens
+			audit.CompletionTokens = finalUsage.CompletionTokens
+			audit.TotalTokens = finalUsage.TotalTokens
+
 			slog.Info("Request completed",
 				"status", resp.StatusCode,
 				"is_stream", isStream,
@@ -152,11 +182,13 @@ func NewChatHandler(cfg *config.Config) http.HandlerFunc {
 				"total_tokens", finalUsage.TotalTokens,
 			)
 		} else {
-			slog.Info("Request completed (No Usage Data Found)",
+			slog.Info("Request completed (No Usage)",
 				"status", resp.StatusCode,
 				"is_stream", isStream,
 				"duration_ms", duration.Milliseconds(),
 			)
 		}
+
+		database.InsertAsync(audit)
 	}
 }
