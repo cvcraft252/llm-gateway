@@ -1,0 +1,8 @@
+server:
+  port: 8080 # The port on which the gateway server will listen
+gateway:
+  keys:
+    - gw-key-123456 # Custom API keys permitted to access this gateway
+upstream:
+  url: "https://api.deepseek.com/v1" # Base URL of the upstream LLM provider (e.g., https://api.openai.com/v1)
+  key: "YOUR_REAL_UPSTREAM_API_KEY"  # Your actual API key from the provider (keep this secret)
