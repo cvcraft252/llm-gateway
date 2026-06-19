@@ -11,6 +11,9 @@ import (
 	"github.com/cvcraft252/llm-gateway/internal/handler"
 	"github.com/cvcraft252/llm-gateway/internal/logger"
 	"github.com/cvcraft252/llm-gateway/internal/middleware"
+
+	// SQLite driver registered globally at application root
+	_ "modernc.org/sqlite"
 )
 
 func main() {
@@ -36,8 +39,12 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Pass database connection to chat handler
-	chatHandler := handler.NewChatHandler(cfg, database)
+	// Pass database connection to chat handler with error check
+	chatHandler, err := handler.NewChatHandler(cfg, database)
+	if err != nil {
+		slog.Error("Failed to initialize chat handler", "error", err)
+		os.Exit(1)
+	}
 	authedChatHandler := middleware.Auth(cfg, chatHandler)
 
 	mux.HandleFunc("POST /v1/chat/completions", authedChatHandler)
@@ -45,7 +52,7 @@ func main() {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status": "ok"}`))
+		_, _ = w.Write([]byte(`{"status": "ok"}`))
 	})
 
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)

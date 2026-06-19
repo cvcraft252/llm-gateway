@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -156,8 +157,11 @@ func (o *observedBody) Close() error {
 	return err
 }
 
-func NewChatHandler(cfg *config.Config, database *db.DB) http.HandlerFunc {
-	targetURL, _ := url.Parse(cfg.Upstream.URL)
+func NewChatHandler(cfg *config.Config, database *db.DB) (http.HandlerFunc, error) {
+	targetURL, err := url.Parse(cfg.Upstream.URL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid upstream url %q: %w", cfg.Upstream.URL, err)
+	}
 	bufPool := newByteBufferPool()
 
 	// Initialize the industry-standard reverse proxy
@@ -195,20 +199,28 @@ func NewChatHandler(cfg *config.Config, database *db.DB) http.HandlerFunc {
 		},
 	}
 
-	return func(w http.ResponseWriter, r *http.Request) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		slog.Info("Received chat request", "path", r.URL.Path, "method", r.Method)
 
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
 			slog.Error("Failed to read body", "error", err)
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error": "Failed to read request body"}`))
 			return
 		}
-		r.Body.Close()
+		_ = r.Body.Close()
 
 		var reqObj chatRequest
-		_ = json.Unmarshal(bodyBytes, &reqObj)
+		if err := json.Unmarshal(bodyBytes, &reqObj); err != nil {
+			slog.Warn("Failed to decode client JSON", "error", err, "ip", r.RemoteAddr)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error": "Invalid request JSON payload"}`))
+			return
+		}
 
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
@@ -220,4 +232,6 @@ func NewChatHandler(cfg *config.Config, database *db.DB) http.HandlerFunc {
 
 		proxy.ServeHTTP(w, r)
 	}
+
+	return handler, nil
 }

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -28,14 +29,14 @@ type UpstreamConfig struct {
 func Load(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open config file at %q: %w", path, err)
 	}
 	defer file.Close()
 
 	var cfg Config
 	decoder := yaml.NewDecoder(file)
 	if err := decoder.Decode(&cfg); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode config yaml at %q: %w", path, err)
 	}
 	return &cfg, nil
 }

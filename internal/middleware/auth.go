@@ -9,7 +9,8 @@ import (
 )
 
 func Auth(cfg *config.Config, next http.HandlerFunc) http.HandlerFunc {
-	validKeys := make(map[string]bool)
+	// Preallocate map capacity based on configured gateway keys
+	validKeys := make(map[string]bool, len(cfg.Gateway.Keys))
 	for _, k := range cfg.Gateway.Keys {
 		validKeys[k] = true
 	}
@@ -20,7 +21,7 @@ func Auth(cfg *config.Config, next http.HandlerFunc) http.HandlerFunc {
 			slog.Warn("Missing Authorization header", "ip", r.RemoteAddr)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"error": "Missing Authorization header"}`))
+			_, _ = w.Write([]byte(`{"error": "Missing Authorization header"}`))
 			return
 		}
 
@@ -29,7 +30,7 @@ func Auth(cfg *config.Config, next http.HandlerFunc) http.HandlerFunc {
 			slog.Warn("Invalid Authorization format", "ip", r.RemoteAddr)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"error": "Invalid Authorization header format"}`))
+			_, _ = w.Write([]byte(`{"error": "Invalid Authorization header format"}`))
 			return
 		}
 
@@ -38,7 +39,7 @@ func Auth(cfg *config.Config, next http.HandlerFunc) http.HandlerFunc {
 			slog.Warn("Unauthorized key attempt", "ip", r.RemoteAddr, "token", token)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"error": "Unauthorized key"}`))
+			_, _ = w.Write([]byte(`{"error": "Unauthorized key"}`))
 			return
 		}
 

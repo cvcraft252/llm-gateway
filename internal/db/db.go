@@ -2,9 +2,8 @@ package db
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
-
-	_ "modernc.org/sqlite"
 )
 
 type DB struct {
@@ -24,7 +23,7 @@ type AuditLog struct {
 func Init(path string) (*DB, error) {
 	conn, err := sql.Open("sqlite", path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open sqlite database at %q: %w", path, err)
 	}
 
 	query := `
@@ -41,8 +40,8 @@ func Init(path string) (*DB, error) {
 	);`
 
 	if _, err := conn.Exec(query); err != nil {
-		conn.Close()
-		return nil, err
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to initialize database schema: %w", err)
 	}
 
 	return &DB{conn: conn}, nil
@@ -52,12 +51,19 @@ func (db *DB) Close() error {
 	return db.conn.Close()
 }
 
-// InsertAsync writes logs in a background goroutine safely.
+// InsertAsync writes logs in a background goroutine safely with panic recovery.
 func (db *DB) InsertAsync(log *AuditLog) {
 	// Copy the struct by value to prevent any pointer lifecycle issues
 	l := *log
 
 	go func() {
+		// Recover guard to prevent background panic from crashing the entire server
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("Recovered from panic in database insert goroutine", "panic", r)
+			}
+		}()
+
 		// Explicitly convert bool to int for SQLite compatibility
 		var streamInt int
 		if l.IsStream {
@@ -77,7 +83,16 @@ func (db *DB) InsertAsync(log *AuditLog) {
 		INSERT INTO audit_logs (model, status_code, is_stream, duration_ms, prompt_tokens, completion_tokens, total_tokens)
 		VALUES (?, ?, ?, ?, ?, ?, ?);`
 
-		_, err := db.conn.Exec(query, l.Model, l.StatusCode, streamInt, l.DurationMs, l.PromptTokens, l.CompletionTokens, l.TotalTokens)
+		_, err := db.conn.Exec(
+			query,
+			l.Model,
+			l.StatusCode,
+			streamInt,
+			l.DurationMs,
+			l.PromptTokens,
+			l.CompletionTokens,
+			l.TotalTokens,
+		)
 		if err != nil {
 			slog.Error("Database insert failed", "error", err)
 		}
