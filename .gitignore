@@ -8,6 +8,10 @@
 *.so
 *.dylib
 
+# Built gateway binary (extensionless, multi-platform variants)
+/gateway
+/gateway-*
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -38,3 +42,6 @@ config.yaml
 
 # Local databases
 *.db
+
+# AI agent instruction files (not part of the project)
+AGENTS.md
