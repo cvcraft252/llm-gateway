@@ -45,3 +45,5 @@ config.yaml
 
 # AI agent instruction files (not part of the project)
 AGENTS.md
+AGENT_SPEC.md
+opencode.json
