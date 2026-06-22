@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/cvcraft252/llm-gateway/internal/config"
+	"github.com/cvcraft252/llm-gateway/internal/respond"
 )
 
 func Auth(cfg *config.Config, next http.HandlerFunc) http.HandlerFunc {
@@ -19,27 +20,21 @@ func Auth(cfg *config.Config, next http.HandlerFunc) http.HandlerFunc {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
 			slog.Warn("Missing Authorization header", "ip", r.RemoteAddr)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error": "Missing Authorization header"}`))
+			respond.WriteJSONError(w, http.StatusUnauthorized, "Missing Authorization header")
 			return
 		}
 
 		parts := strings.Split(authHeader, " ")
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
 			slog.Warn("Invalid Authorization format", "ip", r.RemoteAddr)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error": "Invalid Authorization header format"}`))
+			respond.WriteJSONError(w, http.StatusUnauthorized, "Invalid Authorization header format")
 			return
 		}
 
 		token := parts[1]
 		if !validKeys[token] {
 			slog.Warn("Unauthorized key attempt", "ip", r.RemoteAddr, "token", token)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error": "Unauthorized key"}`))
+			respond.WriteJSONError(w, http.StatusUnauthorized, "Unauthorized key")
 			return
 		}
 

@@ -416,7 +416,7 @@ func TestNewChatHandler_NilRouter(t *testing.T) {
 	}
 	defer database.Close()
 
-	_, err = NewChatHandler(&config.Config{}, database, nil)
+	_, err = NewChatHandler(database, nil)
 	if err == nil {
 		t.Fatalf("NewChatHandler: expected error for nil router, got nil")
 	}
@@ -435,7 +435,7 @@ func TestNewChatHandler_HandlerBadJSON(t *testing.T) {
 	}
 	defer database.Close()
 
-	handler, err := NewChatHandler(&config.Config{}, database, rtr)
+	handler, err := NewChatHandler(database, rtr)
 	if err != nil {
 		t.Fatalf("NewChatHandler: %v", err)
 	}
@@ -492,7 +492,7 @@ func TestNewChatHandler_ModelNotFound(t *testing.T) {
 	}
 	defer database.Close()
 
-	handler, err := NewChatHandler(&config.Config{}, database, rtr)
+	handler, err := NewChatHandler(database, rtr)
 	if err != nil {
 		t.Fatalf("NewChatHandler: %v", err)
 	}
@@ -580,7 +580,7 @@ func TestNewChatHandler_ProxiesToCorrectUpstream(t *testing.T) {
 	}
 	defer database.Close()
 
-	handler, err := NewChatHandler(&config.Config{}, database, rtr)
+	handler, err := NewChatHandler(database, rtr)
 	if err != nil {
 		t.Fatalf("NewChatHandler: %v", err)
 	}
@@ -647,7 +647,7 @@ func TestNewChatHandler_AliasRewritePreservesFields(t *testing.T) {
 	}
 	defer database.Close()
 
-	handler, err := NewChatHandler(&config.Config{}, database, rtr)
+	handler, err := NewChatHandler(database, rtr)
 	if err != nil {
 		t.Fatalf("NewChatHandler: %v", err)
 	}

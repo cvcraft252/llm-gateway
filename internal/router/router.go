@@ -63,7 +63,7 @@ func New(cfg *config.Config) (*Router, error) {
 	}
 
 	r := &Router{
-		byModel:        make(map[string]*Upstream, len(cfg.Upstreams)*4),
+		byModel:        make(map[string]*Upstream),
 		requestTimeout: cfg.Routing.Timeout,
 	}
 

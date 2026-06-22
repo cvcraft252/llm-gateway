@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cvcraft252/llm-gateway/internal/config"
 	"github.com/cvcraft252/llm-gateway/internal/db"
+	"github.com/cvcraft252/llm-gateway/internal/respond"
 	"github.com/cvcraft252/llm-gateway/internal/router"
 )
 
@@ -112,6 +112,10 @@ func (o *observedBody) parseLine(line []byte) {
 	if dataPayload, found := bytes.CutPrefix(trimmed, []byte("data: ")); found {
 		if !bytes.Equal(dataPayload, []byte("[DONE]")) {
 			var chunk streamChunk
+			// Malformed chunks in a live SSE stream are expected (partial
+			// frames, provider-specific keepalives). Silently skipping them
+			// keeps the proxy path fast and avoids log noise; usage extraction
+			// only needs the final well-formed chunk.
 			if err := json.Unmarshal(dataPayload, &chunk); err == nil {
 				if chunk.Usage != nil {
 					o.finalUsage = chunk.Usage
@@ -133,28 +137,28 @@ func (o *observedBody) Close() error {
 		DurationMs: duration.Milliseconds(),
 	}
 
+	msg := "Request completed (No Usage)"
+	logArgs := []any{
+		"upstream", o.upstream,
+		"status", o.statusCode,
+		"is_stream", o.isStream,
+		"duration_ms", duration.Milliseconds(),
+	}
+
 	if o.finalUsage != nil {
 		audit.PromptTokens = o.finalUsage.PromptTokens
 		audit.CompletionTokens = o.finalUsage.CompletionTokens
 		audit.TotalTokens = o.finalUsage.TotalTokens
 
-		slog.Info("Request completed",
-			"upstream", o.upstream,
-			"status", o.statusCode,
-			"is_stream", o.isStream,
-			"duration_ms", duration.Milliseconds(),
+		msg = "Request completed"
+		logArgs = append(logArgs,
 			"prompt_tokens", o.finalUsage.PromptTokens,
 			"completion_tokens", o.finalUsage.CompletionTokens,
 			"total_tokens", o.finalUsage.TotalTokens,
 		)
-	} else {
-		slog.Info("Request completed (No Usage)",
-			"upstream", o.upstream,
-			"status", o.statusCode,
-			"is_stream", o.isStream,
-			"duration_ms", duration.Milliseconds(),
-		)
 	}
+
+	slog.Info(msg, logArgs...)
 
 	o.database.InsertAsync(audit)
 	return err
@@ -172,7 +176,7 @@ func rewriteModel(bodyBytes []byte, targetModel string) ([]byte, error) {
 	return json.Marshal(body)
 }
 
-func NewChatHandler(_ *config.Config, database *db.DB, rtr *router.Router) (http.HandlerFunc, error) {
+func NewChatHandler(database *db.DB, rtr *router.Router) (http.HandlerFunc, error) {
 	if rtr == nil {
 		return nil, errors.New("router is nil")
 	}
@@ -228,7 +232,7 @@ func NewChatHandler(_ *config.Config, database *db.DB, rtr *router.Router) (http
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
 			slog.Error("Failed to read body", "error", err)
-			writeJSONError(w, http.StatusBadRequest, "Failed to read request body")
+			respond.WriteJSONError(w, http.StatusBadRequest, "Failed to read request body")
 			return
 		}
 		_ = r.Body.Close()
@@ -236,14 +240,14 @@ func NewChatHandler(_ *config.Config, database *db.DB, rtr *router.Router) (http
 		var reqObj chatRequest
 		if err := json.Unmarshal(bodyBytes, &reqObj); err != nil {
 			slog.Warn("Failed to decode client JSON", "error", err, "ip", r.RemoteAddr)
-			writeJSONError(w, http.StatusBadRequest, "Invalid request JSON payload")
+			respond.WriteJSONError(w, http.StatusBadRequest, "Invalid request JSON payload")
 			return
 		}
 
 		up, targetModel, err := rtr.Pick(reqObj.Model)
 		if err != nil {
 			slog.Warn("Model not routed", "model", reqObj.Model, "ip", r.RemoteAddr, "error", err)
-			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("model not found: %s", reqObj.Model))
+			respond.WriteJSONError(w, http.StatusNotFound, fmt.Sprintf("model not found: %s", reqObj.Model))
 			return
 		}
 
@@ -252,7 +256,7 @@ func NewChatHandler(_ *config.Config, database *db.DB, rtr *router.Router) (http
 			outBody, err = rewriteModel(bodyBytes, targetModel)
 			if err != nil {
 				slog.Error("Failed to rewrite model alias", "error", err)
-				writeJSONError(w, http.StatusInternalServerError, "failed to rewrite model alias")
+				respond.WriteJSONError(w, http.StatusInternalServerError, "failed to rewrite model alias")
 				return
 			}
 		}
@@ -278,10 +282,4 @@ func NewChatHandler(_ *config.Config, database *db.DB, rtr *router.Router) (http
 	}
 
 	return handler, nil
-}
-
-func writeJSONError(w http.ResponseWriter, status int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = fmt.Fprintf(w, `{"error": %q}`, message)
 }

@@ -50,7 +50,7 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	chatHandler, err := handler.NewChatHandler(cfg, database, rtr)
+	chatHandler, err := handler.NewChatHandler(database, rtr)
 	if err != nil {
 		slog.Error("Failed to initialize chat handler", "error", err)
 		os.Exit(1)

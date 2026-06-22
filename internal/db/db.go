@@ -35,6 +35,7 @@ func Init(path string) (*DB, error) {
 	CREATE TABLE IF NOT EXISTS audit_logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		upstream TEXT,
 		model TEXT,
 		status_code INTEGER,
 		is_stream INTEGER,
