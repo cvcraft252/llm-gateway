@@ -118,7 +118,7 @@ upstreams: []
 			errSubstr: "failed to open config file",
 		},
 		{
-			name: "legacy single upstream schema is rejected",
+			name: "legacy single upstream schema is rejected with migration hint",
 			content: `server:
   port: 8080
 gateway:
@@ -129,7 +129,7 @@ upstream:
   key: "sk-real"
 `,
 			wantErr:   true,
-			errSubstr: "failed to decode config yaml",
+			errSubstr: "was removed in favor of 'upstreams[]'",
 		},
 		{
 			name: "upstream missing name",

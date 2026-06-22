@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -46,6 +47,9 @@ func Load(path string) (*Config, error) {
 	decoder := yaml.NewDecoder(file)
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&cfg); err != nil {
+		if isLegacyUpstreamErr(err) {
+			return nil, fmt.Errorf("failed to decode config yaml at %q: %w\n\nThe single 'upstream' field was removed in favor of 'upstreams[]'. Migrate your config:\n  upstream:\n    url: \"https://api.deepseek.com/v1\"\n    key: \"sk-...\"\n  becomes:\n  upstreams:\n    - name: deepseek\n      url: \"https://api.deepseek.com/v1\"\n      key: \"sk-...\"\n      models:\n        - deepseek-chat\n\nSee config.example.yaml for a working example.", path, err)
+		}
 		return nil, fmt.Errorf("failed to decode config yaml at %q: %w", path, err)
 	}
 
@@ -94,4 +98,11 @@ func (c *Config) validate() error {
 	}
 
 	return nil
+}
+
+// isLegacyUpstreamErr detects the specific KnownFields error produced when a
+// config file still uses the pre-Phase-1 single 'upstream' field, so Load can
+// return a helpful migration message instead of a bare unmarshal error.
+func isLegacyUpstreamErr(err error) bool {
+	return strings.Contains(err.Error(), "field upstream not found")
 }
