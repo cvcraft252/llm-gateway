@@ -133,3 +133,14 @@ If you have an older `config.yaml` with a single `upstream:` block, rename it to
 ## Audit Log
 
 Token usage for every proxied request is persisted asynchronously to a local SQLite database (`gateway.db`). Each row records the upstream name, model, HTTP status, stream flag, duration, and token counts. The database uses WAL mode with a 5-second busy timeout to handle concurrent writes.
+
+## Development Standards
+
+This project follows these [agent skills](https://github.com/samber/cc-skills) during development to keep code idiomatic and consistent:
+
+| Skill | Repository | Usage |
+|---|---|---|
+| [golang-code-style](https://github.com/samber/cc-skills-golang/tree/main/skills/golang-code-style) | [samber/cc-skills-golang](https://github.com/samber/cc-skills-golang) | Go code style conventions — line length, control flow, function design |
+| [golang-error-handling](https://github.com/samber/cc-skills-golang/tree/main/skills/golang-error-handling) | [samber/cc-skills-golang](https://github.com/samber/cc-skills-golang) | Error wrapping with `%w`, sentinel errors, single-handling rule |
+| [golang-testing](https://github.com/samber/cc-skills-golang/tree/main/skills/golang-testing) | [samber/cc-skills-golang](https://github.com/samber/cc-skills-golang) | Table-driven tests, `t.Parallel`, `httptest`, stdlib `testing` only |
+| [conventional-git](https://github.com/samber/cc-skills/tree/main/skills/conventional-git) | [samber/cc-skills](https://github.com/samber/cc-skills) | Conventional Commits for branch names and commit messages |
