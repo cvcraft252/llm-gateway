@@ -11,6 +11,7 @@ import (
 	"github.com/cvcraft252/llm-gateway/internal/handler"
 	"github.com/cvcraft252/llm-gateway/internal/logger"
 	"github.com/cvcraft252/llm-gateway/internal/middleware"
+	"github.com/cvcraft252/llm-gateway/internal/router"
 
 	// SQLite driver registered globally at application root
 	_ "modernc.org/sqlite"
@@ -18,7 +19,7 @@ import (
 
 func main() {
 	logger.Init()
-	slog.Info("Starting LLM Gateway MVP...")
+	slog.Info("Starting LLM Gateway...")
 
 	cfgPath := "config.yaml"
 	cfg, err := config.Load(cfgPath)
@@ -26,9 +27,12 @@ func main() {
 		slog.Error("Failed to load config", "error", err, "path", cfgPath)
 		os.Exit(1)
 	}
-	slog.Info("Configuration loaded successfully", "port", cfg.Server.Port)
+	slog.Info("Configuration loaded successfully",
+		"port", cfg.Server.Port,
+		"upstreams", len(cfg.Upstreams),
+		"timeout", cfg.Routing.Timeout,
+	)
 
-	// Initialize SQLite Database
 	database, err := db.Init("gateway.db")
 	if err != nil {
 		slog.Error("Failed to initialize database", "error", err)
@@ -37,10 +41,16 @@ func main() {
 	defer database.Close()
 	slog.Info("Database initialized successfully")
 
+	rtr, err := router.New(cfg)
+	if err != nil {
+		slog.Error("Failed to build router", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("Router initialized", "upstreams", len(cfg.Upstreams))
+
 	mux := http.NewServeMux()
 
-	// Pass database connection to chat handler with error check
-	chatHandler, err := handler.NewChatHandler(cfg, database)
+	chatHandler, err := handler.NewChatHandler(cfg, database, rtr)
 	if err != nil {
 		slog.Error("Failed to initialize chat handler", "error", err)
 		os.Exit(1)

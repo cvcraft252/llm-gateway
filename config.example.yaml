@@ -1,8 +1,38 @@
 server:
   port: 8080 # The port on which the gateway server will listen
+
 gateway:
   keys:
     - gw-key-123456 # Custom API keys permitted to access this gateway
-upstream:
-  url: "https://api.deepseek.com/v1" # Base URL of the upstream LLM provider (e.g., https://api.openai.com/v1)
-  key: "YOUR_REAL_UPSTREAM_API_KEY"  # Your actual API key from the provider (keep this secret)
+
+# One or more upstream providers. The gateway routes each request to the
+# upstream that declares the requested model. A model may belong to only one
+# upstream. Aliases let clients use a familiar name while the gateway
+# rewrites it to the real model before forwarding.
+upstreams:
+  - name: deepseek
+    url: "https://api.deepseek.com/v1" # Must include the /v1 base path
+    key: "YOUR_DEEPSEEK_API_KEY"
+    models:
+      - deepseek-chat
+      - deepseek-reasoner
+
+  - name: openai
+    url: "https://api.openai.com/v1"
+    key: "YOUR_OPENAI_API_KEY"
+    models:
+      - gpt-4o
+      - gpt-4o-mini
+    aliases:
+      gpt-4: gpt-4o # Client sends gpt-4, upstream receives gpt-4o
+      gpt-4-turbo: gpt-4o
+
+  - name: local-ollama
+    url: "http://localhost:11434/v1" # OpenAI-compatible local server
+    key: "" # Ollama does not require an API key
+    models:
+      - llama3.1
+      - qwen2.5
+
+routing:
+  timeout: 120s # Per-request timeout (default 120s if omitted)

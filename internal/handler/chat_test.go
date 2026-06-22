@@ -2,7 +2,7 @@ package handler
 
 import (
 	"bytes"
-	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +13,7 @@ import (
 
 	"github.com/cvcraft252/llm-gateway/internal/config"
 	"github.com/cvcraft252/llm-gateway/internal/db"
+	"github.com/cvcraft252/llm-gateway/internal/router"
 
 	_ "modernc.org/sqlite"
 )
@@ -233,6 +234,7 @@ data: [DONE]
 	o := &observedBody{
 		ReadCloser: io.NopCloser(strings.NewReader(src)),
 		start:      time.Now().Add(-50 * time.Millisecond),
+		upstream:   "test-upstream",
 		model:      "test-model",
 		isStream:   true,
 		database:   database,
@@ -253,10 +255,13 @@ data: [DONE]
 			t.Fatalf("count: %v", err)
 		}
 		if count == 1 {
-			var model string
+			var upstream, model string
 			var status, isStream, prompt, completion, total int
-			if err := database.Conn().QueryRow("SELECT model, status_code, is_stream, prompt_tokens, completion_tokens, total_tokens FROM audit_logs ORDER BY id LIMIT 1").Scan(&model, &status, &isStream, &prompt, &completion, &total); err != nil {
+			if err := database.Conn().QueryRow("SELECT upstream, model, status_code, is_stream, prompt_tokens, completion_tokens, total_tokens FROM audit_logs ORDER BY id LIMIT 1").Scan(&upstream, &model, &status, &isStream, &prompt, &completion, &total); err != nil {
 				t.Fatalf("scan: %v", err)
+			}
+			if upstream != "test-upstream" {
+				t.Errorf("upstream = %q, want %q", upstream, "test-upstream")
 			}
 			if model != "test-model" {
 				t.Errorf("model = %q, want %q", model, "test-model")
@@ -290,6 +295,7 @@ func TestObservedBody_Close_NoUsage(t *testing.T) {
 	o := &observedBody{
 		ReadCloser: io.NopCloser(strings.NewReader("raw body no sse")),
 		start:      time.Now(),
+		upstream:   "no-usage-upstream",
 		model:      "no-usage-model",
 		isStream:   false,
 		database:   database,
@@ -307,9 +313,13 @@ func TestObservedBody_Close_NoUsage(t *testing.T) {
 			t.Fatalf("count: %v", err)
 		}
 		if count == 1 {
+			var upstream string
 			var prompt, completion, total int
-			if err := database.Conn().QueryRow("SELECT prompt_tokens, completion_tokens, total_tokens FROM audit_logs ORDER BY id LIMIT 1").Scan(&prompt, &completion, &total); err != nil {
+			if err := database.Conn().QueryRow("SELECT upstream, prompt_tokens, completion_tokens, total_tokens FROM audit_logs ORDER BY id LIMIT 1").Scan(&upstream, &prompt, &completion, &total); err != nil {
 				t.Fatalf("scan: %v", err)
+			}
+			if upstream != "no-usage-upstream" {
+				t.Errorf("upstream = %q, want %q", upstream, "no-usage-upstream")
 			}
 			if prompt != 0 || completion != 0 || total != 0 {
 				t.Errorf("tokens = %d/%d/%d, want 0/0/0 (no usage)", prompt, completion, total)
@@ -321,56 +331,111 @@ func TestObservedBody_Close_NoUsage(t *testing.T) {
 	t.Fatalf("audit row not persisted within timeout")
 }
 
-func TestNewChatHandler_InvalidUpstreamURL(t *testing.T) {
+func TestRewriteModel(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		url     string
-		wantErr bool
+		name        string
+		body        string
+		targetModel string
+		wantModel   string
+		wantErr     bool
 	}{
-		{"valid url", "https://api.deepseek.com/v1", false},
-		{"valid http url", "http://localhost:11434/v1", false},
-		{"invalid scheme", "ht!tp://example.com", true},
-		{"missing scheme", "://missing-scheme", true},
+		{
+			name:        "rewrite model field",
+			body:        `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`,
+			targetModel: "gpt-4o",
+			wantModel:   "gpt-4o",
+		},
+		{
+			name:        "preserve other fields",
+			body:        `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream":true,"temperature":0.7}`,
+			targetModel: "gpt-4o",
+			wantModel:   "gpt-4o",
+		},
+		{
+			name:        "invalid json body",
+			body:        `{invalid`,
+			targetModel: "gpt-4o",
+			wantErr:     true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			cfg := &config.Config{
-				Upstream: config.UpstreamConfig{URL: tt.url, Key: "test-key"},
-			}
-			database := &db.DB{}
-
-			_, err := NewChatHandler(cfg, database)
+			out, err := rewriteModel([]byte(tt.body), tt.targetModel)
 			if tt.wantErr {
 				if err == nil {
-					t.Fatalf("NewChatHandler: expected error for url %q, got nil", tt.url)
+					t.Fatalf("rewriteModel: expected error, got nil")
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("NewChatHandler: unexpected error: %v", err)
+				t.Fatalf("rewriteModel: %v", err)
+			}
+
+			var body map[string]any
+			if err := json.Unmarshal(out, &body); err != nil {
+				t.Fatalf("output is not valid JSON: %v", err)
+			}
+			gotModel, ok := body["model"].(string)
+			if !ok {
+				t.Fatalf("model field missing or not a string in output: %s", out)
+			}
+			if gotModel != tt.wantModel {
+				t.Errorf("model = %q, want %q", gotModel, tt.wantModel)
+			}
+			if _, ok := body["messages"]; !ok {
+				t.Errorf("messages field missing from output: %s", out)
 			}
 		})
 	}
 }
 
-func TestNewChatHandler_HandlerBadJSON(t *testing.T) {
+func newTestRouter(t *testing.T, upstreams ...config.UpstreamConfig) *router.Router {
+	t.Helper()
+	cfg := &config.Config{
+		Upstreams: upstreams,
+		Routing:   config.RoutingConfig{Timeout: 10 * time.Second},
+	}
+	rtr, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	return rtr
+}
+
+func TestNewChatHandler_NilRouter(t *testing.T) {
 	t.Parallel()
 
-	cfg := &config.Config{
-		Upstream: config.UpstreamConfig{URL: "https://api.example.com/v1", Key: "test-key"},
-	}
 	database, err := db.Init(t.TempDir() + "/audit.db")
 	if err != nil {
 		t.Fatalf("db.Init: %v", err)
 	}
 	defer database.Close()
 
-	handler, err := NewChatHandler(cfg, database)
+	_, err = NewChatHandler(&config.Config{}, database, nil)
+	if err == nil {
+		t.Fatalf("NewChatHandler: expected error for nil router, got nil")
+	}
+}
+
+func TestNewChatHandler_HandlerBadJSON(t *testing.T) {
+	t.Parallel()
+
+	rtr := newTestRouter(t, config.UpstreamConfig{
+		Name: "test", URL: "https://api.example.com/v1", Key: "test-key",
+		Models: []string{"test-model"},
+	})
+	database, err := db.Init(t.TempDir() + "/audit.db")
+	if err != nil {
+		t.Fatalf("db.Init: %v", err)
+	}
+	defer database.Close()
+
+	handler, err := NewChatHandler(&config.Config{}, database, rtr)
 	if err != nil {
 		t.Fatalf("NewChatHandler: %v", err)
 	}
@@ -414,49 +479,199 @@ func TestNewChatHandler_HandlerBadJSON(t *testing.T) {
 	}
 }
 
-func TestNewChatHandler_ProxiesToUpstream(t *testing.T) {
+func TestNewChatHandler_ModelNotFound(t *testing.T) {
 	t.Parallel()
 
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/chat/completions" {
-			t.Errorf("upstream path = %q, want %q", r.URL.Path, "/v1/chat/completions")
-		}
-		if r.Header.Get("Authorization") != "Bearer test-upstream-key" {
-			t.Errorf("upstream Authorization = %q, want %q", r.Header.Get("Authorization"), "Bearer test-upstream-key")
-		}
-		if r.Header.Get("Content-Type") != "application/json" {
-			t.Errorf("upstream Content-Type = %q, want application/json", r.Header.Get("Content-Type"))
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","model":"test-model","choices":[]}`))
-	}))
-	defer upstream.Close()
-
-	cfg := &config.Config{
-		Upstream: config.UpstreamConfig{URL: upstream.URL + "/v1", Key: "test-upstream-key"},
-	}
+	rtr := newTestRouter(t, config.UpstreamConfig{
+		Name: "test", URL: "https://api.example.com/v1", Key: "test-key",
+		Models: []string{"known-model"},
+	})
 	database, err := db.Init(t.TempDir() + "/audit.db")
 	if err != nil {
 		t.Fatalf("db.Init: %v", err)
 	}
 	defer database.Close()
 
-	handler, err := NewChatHandler(cfg, database)
+	handler, err := NewChatHandler(&config.Config{}, database, rtr)
 	if err != nil {
 		t.Fatalf("NewChatHandler: %v", err)
 	}
 
-	body := `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	body := `{"model":"unknown-model","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	req = req.WithContext(context.Background())
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("model not found")) {
+		t.Errorf("body = %q, want substring %q", rec.Body.String(), "model not found")
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+func TestNewChatHandler_ProxiesToCorrectUpstream(t *testing.T) {
+	t.Parallel()
+
+	var deepseekCalled, openaiCalled bool
+	var deepseekMu, openaiMu sync.Mutex
+
+	deepseek := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deepseekMu.Lock()
+		deepseekCalled = true
+		deepseekMu.Unlock()
+
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("deepseek path = %q, want /v1/chat/completions", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer sk-deepseek" {
+			t.Errorf("deepseek Authorization = %q, want Bearer sk-deepseek", r.Header.Get("Authorization"))
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["model"] != "deepseek-chat" {
+			t.Errorf("deepseek received model = %v, want deepseek-chat", body["model"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ds-1","model":"deepseek-chat"}`))
+	}))
+	defer deepseek.Close()
+
+	openai := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openaiMu.Lock()
+		openaiCalled = true
+		openaiMu.Unlock()
+
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("openai path = %q, want /v1/chat/completions", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer sk-openai" {
+			t.Errorf("openai Authorization = %q, want Bearer sk-openai", r.Header.Get("Authorization"))
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["model"] != "gpt-4o" {
+			t.Errorf("openai received model = %v, want gpt-4o (alias should be rewritten)", body["model"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"oai-1","model":"gpt-4o"}`))
+	}))
+	defer openai.Close()
+
+	rtr := newTestRouter(t,
+		config.UpstreamConfig{
+			Name: "deepseek", URL: deepseek.URL + "/v1", Key: "sk-deepseek",
+			Models: []string{"deepseek-chat"},
+		},
+		config.UpstreamConfig{
+			Name: "openai", URL: openai.URL + "/v1", Key: "sk-openai",
+			Models:  []string{"gpt-4o"},
+			Aliases: map[string]string{"gpt-4": "gpt-4o"},
+		},
+	)
+	database, err := db.Init(t.TempDir() + "/audit.db")
+	if err != nil {
+		t.Fatalf("db.Init: %v", err)
+	}
+	defer database.Close()
+
+	handler, err := NewChatHandler(&config.Config{}, database, rtr)
+	if err != nil {
+		t.Fatalf("NewChatHandler: %v", err)
+	}
+
+	t.Run("routes deepseek-chat to deepseek upstream", func(t *testing.T) {
+		body := `{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want 200", rec.Code)
+		}
+		if !bytes.Contains(rec.Body.Bytes(), []byte("ds-1")) {
+			t.Errorf("body = %q, want substring ds-1", rec.Body.String())
+		}
+		deepseekMu.Lock()
+		defer deepseekMu.Unlock()
+		if !deepseekCalled {
+			t.Errorf("deepseek upstream was not called")
+		}
+	})
+
+	t.Run("routes gpt-4 alias to openai upstream with rewritten model", func(t *testing.T) {
+		body := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want 200", rec.Code)
+		}
+		if !bytes.Contains(rec.Body.Bytes(), []byte("oai-1")) {
+			t.Errorf("body = %q, want substring oai-1", rec.Body.String())
+		}
+		openaiMu.Lock()
+		defer openaiMu.Unlock()
+		if !openaiCalled {
+			t.Errorf("openai upstream was not called")
+		}
+	})
+}
+
+func TestNewChatHandler_AliasRewritePreservesFields(t *testing.T) {
+	t.Parallel()
+
+	var receivedBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	rtr := newTestRouter(t, config.UpstreamConfig{
+		Name: "test", URL: upstream.URL + "/v1", Key: "sk",
+		Models:  []string{"real-model"},
+		Aliases: map[string]string{"alias-name": "real-model"},
+	})
+	database, err := db.Init(t.TempDir() + "/audit.db")
+	if err != nil {
+		t.Fatalf("db.Init: %v", err)
+	}
+	defer database.Close()
+
+	handler, err := NewChatHandler(&config.Config{}, database, rtr)
+	if err != nil {
+		t.Fatalf("NewChatHandler: %v", err)
+	}
+
+	body := `{"model":"alias-name","messages":[{"role":"user","content":"hello"}],"stream":true,"temperature":0.5}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
 	}
-	if !bytes.Contains(rec.Body.Bytes(), []byte("chatcmpl-1")) {
-		t.Errorf("body = %q, want substring %q", rec.Body.String(), "chatcmpl-1")
+
+	if receivedBody["model"] != "real-model" {
+		t.Errorf("upstream received model = %v, want real-model", receivedBody["model"])
+	}
+	if receivedBody["stream"] != true {
+		t.Errorf("stream field = %v, want true", receivedBody["stream"])
+	}
+	if receivedBody["temperature"] != 0.5 {
+		t.Errorf("temperature field = %v, want 0.5", receivedBody["temperature"])
+	}
+	msgs, ok := receivedBody["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Errorf("messages field not preserved, got %v", receivedBody["messages"])
 	}
 }
