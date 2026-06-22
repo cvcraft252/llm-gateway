@@ -21,7 +21,11 @@ type AuditLog struct {
 }
 
 func Init(path string) (*DB, error) {
-	conn, err := sql.Open("sqlite", path)
+	// DSN pragmas apply to every pooled connection, not just the first:
+	//   busy_timeout - concurrent async writers wait instead of failing with SQLITE_BUSY
+	//   journal_mode=WAL - allows readers and a single writer concurrently
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database at %q: %w", path, err)
 	}
@@ -49,6 +53,12 @@ func Init(path string) (*DB, error) {
 
 func (db *DB) Close() error {
 	return db.conn.Close()
+}
+
+// Conn returns the underlying *sql.DB, allowing tests and tooling to run
+// read-only queries against the audit store.
+func (db *DB) Conn() *sql.DB {
+	return db.conn
 }
 
 // InsertAsync writes logs in a background goroutine safely with panic recovery.
