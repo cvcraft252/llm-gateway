@@ -40,8 +40,10 @@ go.work.sum
 # Environment and sensitive configurations
 config.yaml
 
-# Local databases
+# Local databases (SQLite main + WAL mode sidecar files)
 *.db
+*.db-shm
+*.db-wal
 
 # AI agent instruction files (not part of the project)
 AGENTS.md
