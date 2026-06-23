@@ -5,31 +5,35 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/cvcraft252/llm-gateway/internal/db"
 	"github.com/cvcraft252/llm-gateway/internal/respond"
 )
 
-// Handler exposes admin HTTP endpoints for API key management.
-// It is constructed with a KeyStore and a set of admin keys used for
-// authentication. Admin keys are separate from gateway keys — a gateway
-// key cannot access admin endpoints and vice versa (least privilege).
+// Handler exposes admin HTTP endpoints for API key management and audit
+// log querying. It is constructed with a KeyStore, a DB for audit queries,
+// and a set of admin keys used for authentication. Admin keys are separate
+// from gateway keys — a gateway key cannot access admin endpoints and
+// vice versa (least privilege).
 type Handler struct {
 	keyStore    *db.KeyStore
+	database    *db.DB
 	validAdmins map[string]bool
 }
 
 // New creates an admin Handler. adminKeys are the YAML-configured keys
 // allowed to access admin endpoints; they are the trust root and cannot
 // be managed via the API itself.
-func New(keyStore *db.KeyStore, adminKeys []string) *Handler {
+func New(keyStore *db.KeyStore, database *db.DB, adminKeys []string) *Handler {
 	valid := make(map[string]bool, len(adminKeys))
 	for _, k := range adminKeys {
 		valid[k] = true
 	}
 	return &Handler{
 		keyStore:    keyStore,
+		database:    database,
 		validAdmins: valid,
 	}
 }
@@ -142,4 +146,49 @@ func (h *Handler) RevokeKey(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusNoContent)
 	slog.Info("API key revoked", "key_id", keyID)
+}
+
+// ListAuditLogs handles GET /v1/admin/audit/logs.
+// Optional query params: ?key_id=&model=&upstream=&limit=&offset=
+// Response: {"logs": [...], "count": N}
+func (h *Handler) ListAuditLogs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	limit, err := strconv.Atoi(q.Get("limit"))
+	if err != nil {
+		limit = 50 // default
+	}
+	offset, err := strconv.Atoi(q.Get("offset"))
+	if err != nil {
+		offset = 0
+	}
+
+	auditQ := db.AuditQuery{
+		KeyID:    q.Get("key_id"),
+		Model:    q.Get("model"),
+		Upstream: q.Get("upstream"),
+		Limit:    limit,
+		Offset:   offset,
+	}
+
+	records, err := h.database.QueryAuditLogs(r.Context(), auditQ)
+	if err != nil {
+		slog.Error("Failed to query audit logs", "error", err)
+		respond.WriteJSONError(w, http.StatusInternalServerError, "Failed to query audit logs")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(struct {
+		Logs   []db.AuditLogRecord `json:"logs"`
+		Count  int                 `json:"count"`
+		Limit  int                 `json:"limit"`
+		Offset int                 `json:"offset"`
+	}{
+		Logs:   records,
+		Count:  len(records),
+		Limit:  limit,
+		Offset: offset,
+	})
 }

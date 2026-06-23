@@ -22,7 +22,7 @@ func newTestAdmin(t *testing.T) (*admin.Handler, *db.KeyStore, *db.DB) {
 	}
 	t.Cleanup(func() { database.Close() })
 	ks := db.NewKeyStore(database)
-	h := admin.New(ks, []string{"admin-secret-key"})
+	h := admin.New(ks, database, []string{"admin-secret-key"})
 	return h, ks, database
 }
 
@@ -246,6 +246,136 @@ func TestRevokeKey(t *testing.T) {
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("status = %d, want 400", rec.Code)
+		}
+	})
+}
+
+func TestListAuditLogs(t *testing.T) {
+	t.Parallel()
+
+	h, _, database := newTestAdmin(t)
+	ctx := context.Background()
+
+	// Insert test audit records
+	inserts := []struct {
+		keyID, model, upstream string
+		tokens                 int
+	}{
+		{"gw-key00001", "deepseek-chat", "deepseek", 100},
+		{"gw-key00001", "gpt-4o", "openai", 200},
+		{"gw-key00002", "deepseek-chat", "deepseek", 50},
+		{"gw-key00003", "llama3", "ollama", 30},
+	}
+	for _, ins := range inserts {
+		_, err := database.Conn().ExecContext(ctx,
+			`INSERT INTO audit_logs (key_id, model, upstream, total_tokens, status_code, is_stream, duration_ms, prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?, ?, 0, 10, 5, ?)`,
+			ins.keyID, ins.model, ins.upstream, ins.tokens, 200, ins.tokens-5,
+		)
+		if err != nil {
+			t.Fatalf("insert audit: %v", err)
+		}
+	}
+
+	t.Run("list all logs", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/admin/audit/logs", nil)
+		req.Header.Set("Authorization", "Bearer admin-secret-key")
+		rec := httptest.NewRecorder()
+
+		h.ListAuditLogs(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+
+		var resp struct {
+			Logs   []db.AuditLogRecord `json:"logs"`
+			Count  int                 `json:"count"`
+			Limit  int                 `json:"limit"`
+			Offset int                 `json:"offset"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.Count != 4 {
+			t.Errorf("count = %d, want 4", resp.Count)
+		}
+		// Should be ordered by id DESC (newest first)
+		if resp.Logs[0].KeyID != "gw-key00003" {
+			t.Errorf("first log key_id = %q, want %q (newest first)", resp.Logs[0].KeyID, "gw-key00003")
+		}
+	})
+
+	t.Run("filter by key_id", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/admin/audit/logs?key_id=gw-key00001", nil)
+		req.Header.Set("Authorization", "Bearer admin-secret-key")
+		rec := httptest.NewRecorder()
+
+		h.ListAuditLogs(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+
+		var resp struct {
+			Logs  []db.AuditLogRecord `json:"logs"`
+			Count int                 `json:"count"`
+		}
+		_ = json.NewDecoder(rec.Body).Decode(&resp)
+		if resp.Count != 2 {
+			t.Errorf("count = %d, want 2 (filtered by key_id)", resp.Count)
+		}
+		for _, log := range resp.Logs {
+			if log.KeyID != "gw-key00001" {
+				t.Errorf("unexpected key_id %q in filtered results", log.KeyID)
+			}
+		}
+	})
+
+	t.Run("filter by model", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/admin/audit/logs?model=deepseek-chat", nil)
+		req.Header.Set("Authorization", "Bearer admin-secret-key")
+		rec := httptest.NewRecorder()
+
+		h.ListAuditLogs(rec, req)
+
+		var resp struct {
+			Count int `json:"count"`
+		}
+		_ = json.NewDecoder(rec.Body).Decode(&resp)
+		if resp.Count != 2 {
+			t.Errorf("count = %d, want 2 (deepseek-chat)", resp.Count)
+		}
+	})
+
+	t.Run("pagination", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/admin/audit/logs?limit=2&offset=0", nil)
+		req.Header.Set("Authorization", "Bearer admin-secret-key")
+		rec := httptest.NewRecorder()
+
+		h.ListAuditLogs(rec, req)
+
+		var resp struct {
+			Logs  []db.AuditLogRecord `json:"logs"`
+			Count int                 `json:"count"`
+		}
+		_ = json.NewDecoder(rec.Body).Decode(&resp)
+		if resp.Count != 2 {
+			t.Errorf("count = %d, want 2 (limit)", resp.Count)
+		}
+		if len(resp.Logs) != 2 {
+			t.Errorf("logs length = %d, want 2", len(resp.Logs))
+		}
+	})
+
+	t.Run("default limit when invalid", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/admin/audit/logs?limit=abc", nil)
+		req.Header.Set("Authorization", "Bearer admin-secret-key")
+		rec := httptest.NewRecorder()
+
+		h.ListAuditLogs(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (invalid limit should default)", rec.Code)
 		}
 	})
 }

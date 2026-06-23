@@ -63,10 +63,11 @@ func main() {
 	mux.HandleFunc("POST /v1/chat/completions", authedChatHandler)
 
 	// Admin endpoints for key management (separate auth from gateway keys)
-	adminHandler := admin.New(keyStore, cfg.Gateway.AdminKeys)
+	adminHandler := admin.New(keyStore, database, cfg.Gateway.AdminKeys)
 	mux.HandleFunc("POST /v1/admin/keys", adminHandler.AuthMiddleware(adminHandler.CreateKey))
 	mux.HandleFunc("GET /v1/admin/keys", adminHandler.AuthMiddleware(adminHandler.ListKeys))
 	mux.HandleFunc("DELETE /v1/admin/keys/{key_id}", adminHandler.AuthMiddleware(adminHandler.RevokeKey))
+	mux.HandleFunc("GET /v1/admin/audit/logs", adminHandler.AuthMiddleware(adminHandler.ListAuditLogs))
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
