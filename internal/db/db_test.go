@@ -117,6 +117,10 @@ func TestInit_MigratesLegacySchema(t *testing.T) {
 		t.Errorf("upstream column not added by migration")
 	}
 
+	if !columnExists(t, database, "audit_logs", "key_id") {
+		t.Errorf("key_id column not added by migration")
+	}
+
 	var legacyCount int
 	if err := database.Conn().QueryRow("SELECT COUNT(*) FROM audit_logs WHERE model = 'legacy-model'").Scan(&legacyCount); err != nil {
 		t.Fatalf("query legacy row: %v", err)
@@ -131,6 +135,14 @@ func TestInit_MigratesLegacySchema(t *testing.T) {
 	}
 	if legacyUpstream.Valid {
 		t.Errorf("legacy row upstream = %q, want NULL (legacy rows have no upstream)", legacyUpstream.String)
+	}
+
+	var legacyKeyID sql.NullString
+	if err := database.Conn().QueryRow("SELECT key_id FROM audit_logs WHERE model = 'legacy-model'").Scan(&legacyKeyID); err != nil {
+		t.Fatalf("query legacy key_id: %v", err)
+	}
+	if legacyKeyID.Valid {
+		t.Errorf("legacy row key_id = %q, want NULL (legacy rows have no key_id)", legacyKeyID.String)
 	}
 }
 
@@ -155,10 +167,10 @@ func TestInsertAsync(t *testing.T) {
 	defer database.Close()
 
 	logs := []db.AuditLog{
-		{Upstream: "deepseek", Model: "deepseek-chat", StatusCode: 200, IsStream: true, DurationMs: 150, PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30},
-		{Upstream: "deepseek", Model: "deepseek-chat", StatusCode: 200, IsStream: false, DurationMs: 80, PromptTokens: 5, CompletionTokens: 15, TotalTokens: 20},
-		{Upstream: "openai", Model: "gpt-4", StatusCode: 500, IsStream: false, DurationMs: 5, PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0},
-		{Upstream: "", Model: "", StatusCode: 400, IsStream: false, DurationMs: 1, PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0},
+		{Upstream: "deepseek", KeyID: "gw-a1b2c3d4", Model: "deepseek-chat", StatusCode: 200, IsStream: true, DurationMs: 150, PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30},
+		{Upstream: "deepseek", KeyID: "gw-a1b2c3d4", Model: "deepseek-chat", StatusCode: 200, IsStream: false, DurationMs: 80, PromptTokens: 5, CompletionTokens: 15, TotalTokens: 20},
+		{Upstream: "openai", KeyID: "gw-e5f6g7h8", Model: "gpt-4", StatusCode: 500, IsStream: false, DurationMs: 5, PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0},
+		{Upstream: "", KeyID: "", Model: "", StatusCode: 400, IsStream: false, DurationMs: 1, PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0},
 	}
 
 	var wg sync.WaitGroup
@@ -175,7 +187,7 @@ func TestInsertAsync(t *testing.T) {
 		t.Fatalf("rows not persisted: %v", err)
 	}
 
-	rows, err := database.Conn().Query(`SELECT upstream, model, status_code, is_stream, duration_ms, prompt_tokens, completion_tokens, total_tokens FROM audit_logs ORDER BY id`)
+	rows, err := database.Conn().Query(`SELECT upstream, key_id, model, status_code, is_stream, duration_ms, prompt_tokens, completion_tokens, total_tokens FROM audit_logs ORDER BY id`)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -185,7 +197,7 @@ func TestInsertAsync(t *testing.T) {
 	for rows.Next() {
 		var l db.AuditLog
 		var isStream int
-		if err := rows.Scan(&l.Upstream, &l.Model, &l.StatusCode, &isStream, &l.DurationMs, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens); err != nil {
+		if err := rows.Scan(&l.Upstream, &l.KeyID, &l.Model, &l.StatusCode, &isStream, &l.DurationMs, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
 		l.IsStream = isStream == 1
@@ -200,13 +212,13 @@ func TestInsertAsync(t *testing.T) {
 	}
 
 	want := map[string]db.AuditLog{
-		"deepseek:deepseek-chat:200:true":  logs[0],
-		"deepseek:deepseek-chat:200:false": logs[1],
-		"openai:gpt-4:500:false":           logs[2],
-		"::400:false":                      logs[3],
+		"deepseek:gw-a1b2c3d4:deepseek-chat:200:true":  logs[0],
+		"deepseek:gw-a1b2c3d4:deepseek-chat:200:false": logs[1],
+		"openai:gw-e5f6g7h8:gpt-4:500:false":           logs[2],
+		":::400:false":                                 logs[3],
 	}
 	for _, l := range got {
-		key := l.Upstream + ":" + l.Model + ":" + itoa(l.StatusCode) + ":" + boolStr(l.IsStream)
+		key := l.Upstream + ":" + l.KeyID + ":" + l.Model + ":" + itoa(l.StatusCode) + ":" + boolStr(l.IsStream)
 		exp, ok := want[key]
 		if !ok {
 			t.Errorf("unexpected row: %+v", l)
@@ -237,20 +249,21 @@ func TestInsertAsync_StructCopiedByValue(t *testing.T) {
 	}
 	defer database.Close()
 
-	l := db.AuditLog{Upstream: "deepseek", Model: "test-model", StatusCode: 200, IsStream: false, DurationMs: 42, PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3}
+	l := db.AuditLog{Upstream: "deepseek", KeyID: "gw-test1234", Model: "test-model", StatusCode: 200, IsStream: false, DurationMs: 42, PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3}
 	database.InsertAsync(&l)
 
 	l.Model = "mutated-after-call"
 	l.StatusCode = 999
 	l.Upstream = "mutated-upstream"
+	l.KeyID = "mutated-key-id"
 
 	if err := waitForRows(database, 1, 2*time.Second); err != nil {
 		t.Fatalf("rows not persisted: %v", err)
 	}
 
-	var gotUpstream, gotModel string
+	var gotUpstream, gotKeyID, gotModel string
 	var gotStatus int
-	err = database.Conn().QueryRow("SELECT upstream, model, status_code FROM audit_logs ORDER BY id LIMIT 1").Scan(&gotUpstream, &gotModel, &gotStatus)
+	err = database.Conn().QueryRow("SELECT upstream, key_id, model, status_code FROM audit_logs ORDER BY id LIMIT 1").Scan(&gotUpstream, &gotKeyID, &gotModel, &gotStatus)
 	if err != nil {
 		t.Fatalf("QueryRow: %v", err)
 	}
@@ -259,6 +272,9 @@ func TestInsertAsync_StructCopiedByValue(t *testing.T) {
 	}
 	if gotUpstream != "deepseek" {
 		t.Errorf("Upstream = %q, want %q (struct must be copied by value, not mutated after call)", gotUpstream, "deepseek")
+	}
+	if gotKeyID != "gw-test1234" {
+		t.Errorf("KeyID = %q, want %q (struct must be copied by value, not mutated after call)", gotKeyID, "gw-test1234")
 	}
 	if gotStatus != 200 {
 		t.Errorf("StatusCode = %d, want %d", gotStatus, 200)

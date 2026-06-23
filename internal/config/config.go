@@ -20,7 +20,8 @@ type ServerConfig struct {
 }
 
 type GatewayConfig struct {
-	Keys []string `yaml:"keys"`
+	Keys      []string `yaml:"keys"`
+	AdminKeys []string `yaml:"admin_keys"`
 }
 
 type UpstreamConfig struct {
