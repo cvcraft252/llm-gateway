@@ -99,6 +99,9 @@ func (c *Config) validate() error {
 		}
 
 		if u.Fallback != "" {
+			if u.Fallback == u.Name {
+				return fmt.Errorf("upstream %q cannot fall back to itself", u.Name)
+			}
 			if !upstreamNames[u.Fallback] {
 				return fmt.Errorf("fallback %q for upstream %q not found", u.Fallback, u.Name)
 			}
@@ -111,6 +114,10 @@ func (c *Config) validate() error {
 
 	if c.Routing.MaxRetries < 0 {
 		c.Routing.MaxRetries = 0
+	}
+
+	if c.Routing.RetryBackoff <= 0 {
+		c.Routing.RetryBackoff = 500 * time.Millisecond
 	}
 
 	if c.Routing.HealthMaxFailures <= 0 {

@@ -252,6 +252,94 @@ func TestPick_AliasOnlyNotInModels(t *testing.T) {
 	}
 }
 
+func TestNew_CircularFallbackDetected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		upstreams []config.UpstreamConfig
+		wantErr   string
+	}{
+		{
+			name: "two-node cycle A -> B -> A",
+			upstreams: []config.UpstreamConfig{
+				{Name: "a", URL: "https://a/v1", Key: "k", Models: []string{"m-a"}, Fallback: "b"},
+				{Name: "b", URL: "https://b/v1", Key: "k", Models: []string{"m-b"}, Fallback: "a"},
+			},
+			wantErr: "circular fallback detected",
+		},
+		{
+			name: "three-node cycle A -> B -> C -> A",
+			upstreams: []config.UpstreamConfig{
+				{Name: "a", URL: "https://a/v1", Key: "k", Models: []string{"m-a"}, Fallback: "b"},
+				{Name: "b", URL: "https://b/v1", Key: "k", Models: []string{"m-b"}, Fallback: "c"},
+				{Name: "c", URL: "https://c/v1", Key: "k", Models: []string{"m-c"}, Fallback: "a"},
+			},
+			wantErr: "circular fallback detected",
+		},
+		{
+			name: "valid chain A -> B -> C (no cycle)",
+			upstreams: []config.UpstreamConfig{
+				{Name: "a", URL: "https://a/v1", Key: "k", Models: []string{"m-a"}, Fallback: "b"},
+				{Name: "b", URL: "https://b/v1", Key: "k", Models: []string{"m-b"}, Fallback: "c"},
+				{Name: "c", URL: "https://c/v1", Key: "k", Models: []string{"m-c"}},
+			},
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &config.Config{Upstreams: tt.upstreams}
+			_, err := router.New(cfg)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("New: expected error containing %q, got nil", tt.wantErr)
+				}
+				if !contains(err.Error(), tt.wantErr) {
+					t.Errorf("New: error = %q, want substring %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New: unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestNew_FallbackResolvesCorrectly(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		Upstreams: []config.UpstreamConfig{
+			{Name: "primary", URL: "https://p/v1", Key: "k", Models: []string{"m1"}, Fallback: "secondary"},
+			{Name: "secondary", URL: "https://s/v1", Key: "k", Models: []string{"m2"}},
+		},
+	}
+
+	rtr, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	up, _, err := rtr.Pick("m1")
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	if up.Fallback == nil {
+		t.Fatalf("primary upstream should have a fallback")
+	}
+	if up.Fallback.Name != "secondary" {
+		t.Errorf("fallback name = %q, want %q", up.Fallback.Name, "secondary")
+	}
+	if up.Fallback.Fallback != nil {
+		t.Errorf("secondary upstream should not have a fallback")
+	}
+}
+
 func contains(s, substr string) bool {
 	for i := 0; i+len(substr) <= len(s); i++ {
 		if s[i:i+len(substr)] == substr {

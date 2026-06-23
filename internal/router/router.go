@@ -132,11 +132,18 @@ func New(cfg *config.Config) (*Router, error) {
 			fallbackUp := upstreamsByName[uc.Fallback]
 			up.Fallback = fallbackUp
 
+			// Walk the fallback chain with a visited set to detect cycles
+			// in O(n) instead of rescanning the chain for each upstream.
+			visited := make(map[string]bool)
 			curr := fallbackUp
 			for curr != nil {
 				if curr.Name == up.Name {
 					return nil, fmt.Errorf("circular fallback detected involving upstream %q", up.Name)
 				}
+				if visited[curr.Name] {
+					return nil, fmt.Errorf("circular fallback detected involving upstream %q", curr.Name)
+				}
+				visited[curr.Name] = true
 				curr = curr.Fallback
 			}
 		}

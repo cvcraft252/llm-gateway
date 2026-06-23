@@ -238,6 +238,57 @@ unknown_field: 42
 			wantErr:   true,
 			errSubstr: "failed to decode config yaml",
 		},
+		{
+			name: "self-referencing fallback is rejected",
+			content: `server:
+  port: 8080
+upstreams:
+  - name: deepseek
+    url: "https://api.deepseek.com/v1"
+    key: "sk"
+    models:
+      - deepseek-chat
+    fallback: deepseek
+`,
+			wantErr:   true,
+			errSubstr: "cannot fall back to itself",
+		},
+		{
+			name: "fallback referencing unknown upstream is rejected",
+			content: `server:
+  port: 8080
+upstreams:
+  - name: deepseek
+    url: "https://api.deepseek.com/v1"
+    key: "sk"
+    models:
+      - deepseek-chat
+    fallback: nonexistent
+`,
+			wantErr:   true,
+			errSubstr: "not found",
+		},
+		{
+			name: "retry_backoff defaults to 500ms when omitted",
+			content: `server:
+  port: 8080
+upstreams:
+  - name: a
+    url: "https://a/v1"
+    key: "sk"
+    models:
+      - m1
+routing:
+  max_retries: 3
+`,
+			wantErr: false,
+			check: func(t *testing.T, cfg *config.Config) {
+				t.Helper()
+				if cfg.Routing.RetryBackoff != 500*time.Millisecond {
+					t.Errorf("RetryBackoff = %v, want 500ms", cfg.Routing.RetryBackoff)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {

@@ -951,3 +951,81 @@ func TestNewChatHandler_DegradedSkipping(t *testing.T) {
 		t.Errorf("expected primary server to be skipped (calls should remain 1), got %d", calls2)
 	}
 }
+
+func TestNewChatHandler_StreamResponseDoesNotRetry(t *testing.T) {
+	t.Parallel()
+
+	var callCount int
+	var mu sync.Mutex
+
+	streamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		callCount++
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer streamServer.Close()
+
+	fallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("fallback server should not be called when primary returned 200")
+	}))
+	defer fallbackServer.Close()
+
+	cfg := &config.Config{
+		Upstreams: []config.UpstreamConfig{
+			{
+				Name:     "stream",
+				URL:      streamServer.URL + "/v1",
+				Key:      "key",
+				Models:   []string{"stream-model"},
+				Fallback: "fallback",
+			},
+			{
+				Name:   "fallback",
+				URL:    fallbackServer.URL + "/v1",
+				Key:    "key",
+				Models: []string{"fallback-model"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Timeout:      2 * time.Second,
+			MaxRetries:   3,
+			RetryBackoff: 1 * time.Millisecond,
+		},
+	}
+	rtr, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+
+	database, err := db.Init(t.TempDir() + "/audit.db")
+	if err != nil {
+		t.Fatalf("db.Init: %v", err)
+	}
+	defer database.Close()
+
+	handler, err := NewChatHandler(database, rtr)
+	if err != nil {
+		t.Fatalf("NewChatHandler: %v", err)
+	}
+
+	body := `{"model":"stream-model","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rec.Code)
+	}
+
+	mu.Lock()
+	calls := callCount
+	mu.Unlock()
+	if calls != 1 {
+		t.Errorf("stream upstream should be called exactly once (no retry after 200), got %d", calls)
+	}
+}
