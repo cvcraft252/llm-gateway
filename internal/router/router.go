@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cvcraft252/llm-gateway/internal/config"
+	"github.com/cvcraft252/llm-gateway/internal/health"
 )
 
 // ErrModelNotFound is returned by Pick when no upstream declares the requested model.
@@ -15,10 +16,11 @@ var ErrModelNotFound = errors.New("model not found")
 // Upstream is a resolved, ready-to-route upstream provider. It is immutable
 // after construction and safe for concurrent reads.
 type Upstream struct {
-	Name    string
-	URL     *url.URL
-	Key     string
-	Aliases map[string]string
+	Name     string
+	URL      *url.URL
+	Key      string
+	Aliases  map[string]string
+	Fallback *Upstream
 }
 
 // Router maps incoming model names to the upstream that serves them. The map
@@ -27,11 +29,34 @@ type Upstream struct {
 type Router struct {
 	byModel        map[string]*Upstream
 	requestTimeout time.Duration
+	maxRetries     int
+	retryBackoff   time.Duration
+	tracker        *health.Tracker
 }
 
 // RequestTimeout returns the per-request timeout configured via routing.timeout.
 func (r *Router) RequestTimeout() time.Duration {
 	return r.requestTimeout
+}
+
+func (r *Router) MaxRetries() int {
+	return r.maxRetries
+}
+
+func (r *Router) RetryBackoff() time.Duration {
+	return r.retryBackoff
+}
+
+func (r *Router) RecordSuccess(upstream string) {
+	r.tracker.RecordSuccess(upstream)
+}
+
+func (r *Router) RecordFailure(upstream string) {
+	r.tracker.RecordFailure(upstream)
+}
+
+func (r *Router) IsDegraded(upstream string) bool {
+	return r.tracker.IsDegraded(upstream)
 }
 
 // Pick returns the upstream responsible for the requested model and the
@@ -65,7 +90,12 @@ func New(cfg *config.Config) (*Router, error) {
 	r := &Router{
 		byModel:        make(map[string]*Upstream),
 		requestTimeout: cfg.Routing.Timeout,
+		maxRetries:     cfg.Routing.MaxRetries,
+		retryBackoff:   cfg.Routing.RetryBackoff,
+		tracker:        health.NewTracker(cfg.Routing.HealthMaxFailures, cfg.Routing.HealthCooldown),
 	}
+
+	upstreamsByName := make(map[string]*Upstream)
 
 	for i := range cfg.Upstreams {
 		uc := &cfg.Upstreams[i]
@@ -85,11 +115,30 @@ func New(cfg *config.Config) (*Router, error) {
 			Aliases: uc.Aliases,
 		}
 
+		upstreamsByName[up.Name] = up
+
 		for _, m := range uc.Models {
 			r.byModel[m] = up
 		}
 		for alias := range uc.Aliases {
 			r.byModel[alias] = up
+		}
+	}
+
+	for i := range cfg.Upstreams {
+		uc := &cfg.Upstreams[i]
+		if uc.Fallback != "" {
+			up := upstreamsByName[uc.Name]
+			fallbackUp := upstreamsByName[uc.Fallback]
+			up.Fallback = fallbackUp
+
+			curr := fallbackUp
+			for curr != nil {
+				if curr.Name == up.Name {
+					return nil, fmt.Errorf("circular fallback detected involving upstream %q", up.Name)
+				}
+				curr = curr.Fallback
+			}
 		}
 	}
 

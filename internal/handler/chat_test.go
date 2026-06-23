@@ -675,3 +675,279 @@ func TestNewChatHandler_AliasRewritePreservesFields(t *testing.T) {
 		t.Errorf("messages field not preserved, got %v", receivedBody["messages"])
 	}
 }
+
+func TestNewChatHandler_RetryAndFailover(t *testing.T) {
+	t.Parallel()
+
+	// 1. Setup a flaky upstream (fails on first call, succeeds on second)
+	var flakyCalls int
+	var flakyMu sync.Mutex
+	flakyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flakyMu.Lock()
+		flakyCalls++
+		currentCall := flakyCalls
+		flakyMu.Unlock()
+
+		if currentCall == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error": "internal error"}`))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"flaky-ok","model":"flaky-model"}`))
+	}))
+	defer flakyServer.Close()
+
+	// 2. Setup a failing upstream (always fails)
+	failingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error": "always fails"}`))
+	}))
+	defer failingServer.Close()
+
+	// 3. Setup a fallback server (succeeds)
+	fallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"fallback-ok","model":"fallback-model"}`))
+	}))
+	defer fallbackServer.Close()
+
+	// 4. Create router with:
+	// - Upstream "flaky" with max_retries = 1
+	// - Upstream "failing" with fallback = "fallback"
+	cfg := &config.Config{
+		Upstreams: []config.UpstreamConfig{
+			{
+				Name:   "flaky",
+				URL:    flakyServer.URL + "/v1",
+				Key:    "key",
+				Models: []string{"flaky-model"},
+			},
+			{
+				Name:     "failing",
+				URL:      failingServer.URL + "/v1",
+				Key:      "key",
+				Models:   []string{"failover-model"},
+				Fallback: "fallback",
+			},
+			{
+				Name:   "fallback",
+				URL:    fallbackServer.URL + "/v1",
+				Key:    "key",
+				Models: []string{"fallback-model"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Timeout:      2 * time.Second,
+			MaxRetries:   2,
+			RetryBackoff: 1 * time.Millisecond,
+		},
+	}
+	rtr, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+
+	database, err := db.Init(t.TempDir() + "/audit.db")
+	if err != nil {
+		t.Fatalf("db.Init: %v", err)
+	}
+	defer database.Close()
+
+	handler, err := NewChatHandler(database, rtr)
+	if err != nil {
+		t.Fatalf("NewChatHandler: %v", err)
+	}
+
+	t.Run("retry-then-success path", func(t *testing.T) {
+		body := `{"model":"flaky-model","messages":[]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d. Body: %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "flaky-ok") {
+			t.Errorf("expected body to contain 'flaky-ok', got: %s", rec.Body.String())
+		}
+		flakyMu.Lock()
+		calls := flakyCalls
+		flakyMu.Unlock()
+		if calls != 2 {
+			t.Errorf("expected 2 calls to flaky server, got %d", calls)
+		}
+	})
+
+	t.Run("retry-then-fallback path", func(t *testing.T) {
+		body := `{"model":"failover-model","messages":[]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d. Body: %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "fallback-ok") {
+			t.Errorf("expected body to contain 'fallback-ok', got: %s", rec.Body.String())
+		}
+	})
+}
+
+func TestNewChatHandler_RetryExhausted(t *testing.T) {
+	t.Parallel()
+
+	var callCount int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		callCount++
+		mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		Upstreams: []config.UpstreamConfig{
+			{
+				Name:   "bad",
+				URL:    srv.URL + "/v1",
+				Key:    "key",
+				Models: []string{"bad-model"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Timeout:      2 * time.Second,
+			MaxRetries:   2, // 1 primary attempt + 2 retries = 3 total attempts
+			RetryBackoff: 1 * time.Millisecond,
+		},
+	}
+	rtr, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+
+	database, err := db.Init(t.TempDir() + "/audit.db")
+	if err != nil {
+		t.Fatalf("db.Init: %v", err)
+	}
+	defer database.Close()
+
+	handler, err := NewChatHandler(database, rtr)
+	if err != nil {
+		t.Fatalf("NewChatHandler: %v", err)
+	}
+
+	body := `{"model":"bad-model","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d. Body: %s", rec.Code, rec.Body.String())
+	}
+
+	mu.Lock()
+	calls := callCount
+	mu.Unlock()
+	if calls != 3 {
+		t.Errorf("expected 3 total attempts (1 try + 2 retries), got %d", calls)
+	}
+}
+
+func TestNewChatHandler_DegradedSkipping(t *testing.T) {
+	t.Parallel()
+
+	var primaryCalls int
+	var primaryMu sync.Mutex
+	primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryMu.Lock()
+		primaryCalls++
+		primaryMu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer primaryServer.Close()
+
+	fallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"fallback-ok","model":"fallback-model"}`))
+	}))
+	defer fallbackServer.Close()
+
+	cfg := &config.Config{
+		Upstreams: []config.UpstreamConfig{
+			{
+				Name:     "primary",
+				URL:      primaryServer.URL + "/v1",
+				Key:      "key",
+				Models:   []string{"some-model"},
+				Fallback: "fallback",
+			},
+			{
+				Name:   "fallback",
+				URL:    fallbackServer.URL + "/v1",
+				Key:    "key",
+				Models: []string{"fallback-model"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Timeout:           2 * time.Second,
+			MaxRetries:        0,
+			HealthMaxFailures: 1, // Degrades after 1 failure
+			HealthCooldown:    10 * time.Second,
+		},
+	}
+	rtr, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+
+	database, err := db.Init(t.TempDir() + "/audit.db")
+	if err != nil {
+		t.Fatalf("db.Init: %v", err)
+	}
+	defer database.Close()
+
+	handler, err := NewChatHandler(database, rtr)
+	if err != nil {
+		t.Fatalf("NewChatHandler: %v", err)
+	}
+
+	body := `{"model":"some-model","messages":[]}`
+
+	// First Request: goes to primary, fails, triggers fallback failover.
+	// This record a failure on "primary", marking it degraded (max_failures is 1)
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("Req1 failed: %d - %s", rec1.Code, rec1.Body.String())
+	}
+
+	primaryMu.Lock()
+	calls1 := primaryCalls
+	primaryMu.Unlock()
+	if calls1 != 1 {
+		t.Errorf("expected 1 call to primary server so far, got %d", calls1)
+	}
+
+	// Second Request: "primary" is degraded. Handler should skip "primary" entirely
+	// and route straight to "fallback".
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("Req2 failed: %d - %s", rec2.Code, rec2.Body.String())
+	}
+
+	primaryMu.Lock()
+	calls2 := primaryCalls
+	primaryMu.Unlock()
+	if calls2 != 1 {
+		t.Errorf("expected primary server to be skipped (calls should remain 1), got %d", calls2)
+	}
+}

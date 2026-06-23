@@ -16,6 +16,7 @@ upstreams:
     models:
       - deepseek-chat
       - deepseek-reasoner
+    fallback: openai # Failover to openai if deepseek is degraded/unavailable
 
   - name: openai
     url: "https://api.openai.com/v1"
@@ -36,3 +37,7 @@ upstreams:
 
 routing:
   timeout: 120s # Per-request timeout (default 120s if omitted)
+  max_retries: 2 # Bounded retries on same upstream before failover or aborting
+  retry_backoff: 500ms # Backoff delay between retries
+  health_max_failures: 3 # Failures before marking upstream degraded
+  health_cooldown: 30s # Cool-down duration to skip degraded upstream

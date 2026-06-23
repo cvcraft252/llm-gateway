@@ -41,7 +41,6 @@ type streamChunk struct {
 	Usage *Usage `json:"usage"`
 }
 
-// byteBufferPool implements httputil.BufferPool using sync.Pool for zero-allocation proxying.
 type byteBufferPool struct {
 	pool sync.Pool
 }
@@ -65,15 +64,12 @@ func (p *byteBufferPool) Put(b []byte) {
 	p.pool.Put(&b)
 }
 
-// proxyTransport is shared across all proxied requests. Per-host idle limits
-// are intentionally high because the gateway may fan out to multiple upstreams.
 var proxyTransport = &http.Transport{
 	MaxIdleConns:        100,
 	MaxIdleConnsPerHost: 100,
 	IdleConnTimeout:     90 * time.Second,
 }
 
-// observedBody intercepts the read stream to extract token usage without adding latency.
 type observedBody struct {
 	io.ReadCloser
 	start      time.Time
@@ -112,10 +108,6 @@ func (o *observedBody) parseLine(line []byte) {
 	if dataPayload, found := bytes.CutPrefix(trimmed, []byte("data: ")); found {
 		if !bytes.Equal(dataPayload, []byte("[DONE]")) {
 			var chunk streamChunk
-			// Malformed chunks in a live SSE stream are expected (partial
-			// frames, provider-specific keepalives). Silently skipping them
-			// keeps the proxy path fast and avoids log noise; usage extraction
-			// only needs the final well-formed chunk.
 			if err := json.Unmarshal(dataPayload, &chunk); err == nil {
 				if chunk.Usage != nil {
 					o.finalUsage = chunk.Usage
@@ -129,7 +121,9 @@ func (o *observedBody) Close() error {
 	err := o.ReadCloser.Close()
 
 	duration := time.Since(o.start)
-	audit := &db.AuditLog{
+
+	// Value Copy here is vital for safe DB InsertAsync
+	audit := db.AuditLog{
 		Upstream:   o.upstream,
 		Model:      o.model,
 		StatusCode: o.statusCode,
@@ -160,13 +154,11 @@ func (o *observedBody) Close() error {
 
 	slog.Info(msg, logArgs...)
 
-	o.database.InsertAsync(audit)
+	// Pass pointer to fresh copy
+	o.database.InsertAsync(&audit)
 	return err
 }
 
-// rewriteModel replaces the model field in the JSON body when an alias maps
-// to a different target model. Returns the original bytes when no rewrite is
-// needed. Uses map[string]any to preserve all other fields from the client.
 func rewriteModel(bodyBytes []byte, targetModel string) ([]byte, error) {
 	var body map[string]any
 	if err := json.Unmarshal(bodyBytes, &body); err != nil {
@@ -181,49 +173,6 @@ func NewChatHandler(database *db.DB, rtr *router.Router) (http.HandlerFunc, erro
 		return nil, errors.New("router is nil")
 	}
 	bufPool := newByteBufferPool()
-
-	proxy := &httputil.ReverseProxy{
-		Transport:     proxyTransport,
-		FlushInterval: -1,
-		BufferPool:    bufPool,
-		Director: func(req *http.Request) {
-			ctx := req.Context()
-			up, _ := ctx.Value(ctxKeyUpstream).(*router.Upstream)
-
-			req.URL.Scheme = up.URL.Scheme
-			req.URL.Host = up.URL.Host
-			req.URL.Path = up.URL.Path + "/chat/completions"
-			req.Host = up.URL.Host
-
-			req.Header.Set("Authorization", "Bearer "+up.Key)
-			req.Header.Set("Content-Type", "application/json")
-		},
-		ModifyResponse: func(resp *http.Response) error {
-			ctx := resp.Request.Context()
-			start, _ := ctx.Value(ctxKeyStart).(time.Time)
-			model, _ := ctx.Value(ctxKeyModel).(string)
-			up, _ := ctx.Value(ctxKeyUpstream).(*router.Upstream)
-
-			contentType := resp.Header.Get("Content-Type")
-			isStream := strings.Contains(strings.ToLower(contentType), "text/event-stream")
-
-			upstreamName := ""
-			if up != nil {
-				upstreamName = up.Name
-			}
-
-			resp.Body = &observedBody{
-				ReadCloser: resp.Body,
-				start:      start,
-				upstream:   upstreamName,
-				model:      model,
-				isStream:   isStream,
-				database:   database,
-				statusCode: resp.StatusCode,
-			}
-			return nil
-		},
-	}
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -244,41 +193,139 @@ func NewChatHandler(database *db.DB, rtr *router.Router) (http.HandlerFunc, erro
 			return
 		}
 
-		up, targetModel, err := rtr.Pick(reqObj.Model)
+		up, _, err := rtr.Pick(reqObj.Model)
 		if err != nil {
 			slog.Warn("Model not routed", "model", reqObj.Model, "ip", r.RemoteAddr, "error", err)
 			respond.WriteJSONError(w, http.StatusNotFound, fmt.Sprintf("model not found: %s", reqObj.Model))
 			return
 		}
 
-		outBody := bodyBytes
-		if targetModel != reqObj.Model {
-			outBody, err = rewriteModel(bodyBytes, targetModel)
-			if err != nil {
-				slog.Error("Failed to rewrite model alias", "error", err)
-				respond.WriteJSONError(w, http.StatusInternalServerError, "failed to rewrite model alias")
+		maxRetries := rtr.MaxRetries()
+		attempt := 0
+		retryBackoff := rtr.RetryBackoff()
+
+		for {
+			// Skip degraded upstreams if fallback alternates exist
+			for up != nil && rtr.IsDegraded(up.Name) {
+				if up.Fallback != nil {
+					slog.Info("Skipping degraded upstream", "upstream", up.Name, "fallback", up.Fallback.Name)
+					up = up.Fallback
+					attempt = 0 // Reset attempt counter for new upstream
+				} else {
+					break
+				}
+			}
+
+			if up == nil {
+				respond.WriteJSONError(w, http.StatusBadGateway, "No available upstreams")
+				return
+			}
+
+			targetModel := reqObj.Model
+			if alias, ok := up.Aliases[reqObj.Model]; ok {
+				targetModel = alias
+			}
+
+			outBody := bodyBytes
+			if targetModel != reqObj.Model {
+				outBody, err = rewriteModel(bodyBytes, targetModel)
+				if err != nil {
+					slog.Error("Failed to rewrite model alias", "error", err)
+					respond.WriteJSONError(w, http.StatusInternalServerError, "failed to rewrite model alias")
+					return
+				}
+			}
+
+			ctx, cancel := context.WithTimeout(r.Context(), rtr.RequestTimeout())
+
+			ctx = context.WithValue(ctx, ctxKeyStart, start)
+			ctx = context.WithValue(ctx, ctxKeyModel, reqObj.Model)
+			ctx = context.WithValue(ctx, ctxKeyUpstream, up)
+
+			// Always create a fresh clone of request for reverse proxy
+			proxyReq := r.Clone(ctx)
+			proxyReq.Body = io.NopCloser(bytes.NewReader(outBody))
+			proxyReq.ContentLength = int64(len(outBody))
+
+			slog.Info("Routing request",
+				"model", reqObj.Model,
+				"target_model", targetModel,
+				"upstream", up.Name,
+				"attempt", attempt,
+			)
+
+			// Setup reverse proxy for this attempt.
+			var proxyErr error
+
+			currentUp := up
+
+			proxy := &httputil.ReverseProxy{
+				Transport:     proxyTransport,
+				FlushInterval: -1,
+				BufferPool:    bufPool,
+				Director: func(req *http.Request) {
+					req.URL.Scheme = currentUp.URL.Scheme
+					req.URL.Host = currentUp.URL.Host
+					req.URL.Path = currentUp.URL.Path + "/chat/completions"
+					req.Host = currentUp.URL.Host
+
+					req.Header.Set("Authorization", "Bearer "+currentUp.Key)
+					req.Header.Set("Content-Type", "application/json")
+				},
+				ModifyResponse: func(resp *http.Response) error {
+					if resp.StatusCode >= 500 {
+						return fmt.Errorf("upstream returned 5xx status: %d", resp.StatusCode)
+					}
+
+					contentType := resp.Header.Get("Content-Type")
+					isStream := strings.Contains(strings.ToLower(contentType), "text/event-stream")
+
+					resp.Body = &observedBody{
+						ReadCloser: resp.Body,
+						start:      start,
+						upstream:   currentUp.Name,
+						model:      reqObj.Model,
+						isStream:   isStream,
+						database:   database,
+						statusCode: resp.StatusCode,
+					}
+					return nil
+				},
+				ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
+					proxyErr = err
+				},
+			}
+
+			proxy.ServeHTTP(w, proxyReq)
+			cancel() // Free this attempt's context
+
+			if proxyErr == nil {
+				rtr.RecordSuccess(currentUp.Name)
+				break
+			}
+
+			// Record failure on the current upstream
+			rtr.RecordFailure(currentUp.Name)
+
+			attempt++
+			slog.Warn("Upstream request failed", "upstream", currentUp.Name, "error", proxyErr, "attempt", attempt)
+
+			// Determine next hop or abort
+			if currentUp.Fallback != nil {
+				slog.Info("Failing over to fallback upstream", "from", currentUp.Name, "to", currentUp.Fallback.Name)
+				up = currentUp.Fallback
+				attempt = 0 // Reset attempt counter for new upstream
+			} else if attempt <= maxRetries {
+				slog.Info("Retrying same upstream", "upstream", currentUp.Name, "attempt", attempt, "maxRetries", maxRetries)
+				if retryBackoff > 0 {
+					time.Sleep(retryBackoff)
+				}
+			} else {
+				slog.Error("Max retries reached on upstream and no fallback configured", "upstream", currentUp.Name)
+				respond.WriteJSONError(w, http.StatusBadGateway, "Upstream is unavailable")
 				return
 			}
 		}
-		r.Body = io.NopCloser(bytes.NewReader(outBody))
-		r.ContentLength = int64(len(outBody))
-
-		timeout := rtr.RequestTimeout()
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
-		defer cancel()
-
-		ctx = context.WithValue(ctx, ctxKeyStart, start)
-		ctx = context.WithValue(ctx, ctxKeyModel, reqObj.Model)
-		ctx = context.WithValue(ctx, ctxKeyUpstream, up)
-		r = r.WithContext(ctx)
-
-		slog.Info("Routing request",
-			"model", reqObj.Model,
-			"target_model", targetModel,
-			"upstream", up.Name,
-		)
-
-		proxy.ServeHTTP(w, r)
 	}
 
 	return handler, nil

@@ -24,15 +24,20 @@ type GatewayConfig struct {
 }
 
 type UpstreamConfig struct {
-	Name    string            `yaml:"name"`
-	URL     string            `yaml:"url"`
-	Key     string            `yaml:"key"`
-	Models  []string          `yaml:"models"`
-	Aliases map[string]string `yaml:"aliases"`
+	Name     string            `yaml:"name"`
+	URL      string            `yaml:"url"`
+	Key      string            `yaml:"key"`
+	Models   []string          `yaml:"models"`
+	Aliases  map[string]string `yaml:"aliases"`
+	Fallback string            `yaml:"fallback"`
 }
 
 type RoutingConfig struct {
-	Timeout time.Duration `yaml:"timeout"`
+	Timeout           time.Duration `yaml:"timeout"`
+	MaxRetries        int           `yaml:"max_retries"`
+	RetryBackoff      time.Duration `yaml:"retry_backoff"`
+	HealthMaxFailures int           `yaml:"health_max_failures"`
+	HealthCooldown    time.Duration `yaml:"health_cooldown"`
 }
 
 func Load(path string) (*Config, error) {
@@ -62,6 +67,7 @@ func (c *Config) validate() error {
 	}
 
 	seenModels := make(map[string]string)
+	upstreamNames := make(map[string]bool)
 	for i, u := range c.Upstreams {
 		if u.Name == "" {
 			return fmt.Errorf("upstream[%d]: name is required", i)
@@ -72,6 +78,10 @@ func (c *Config) validate() error {
 		if len(u.Models) == 0 {
 			return fmt.Errorf("upstream %q: at least one model must be listed", u.Name)
 		}
+		upstreamNames[u.Name] = true
+	}
+
+	for _, u := range c.Upstreams {
 		for _, m := range u.Models {
 			if prev, exists := seenModels[m]; exists {
 				return fmt.Errorf("model %q is claimed by both upstream %q and %q", m, prev, u.Name)
@@ -87,10 +97,28 @@ func (c *Config) validate() error {
 			}
 			seenModels[alias] = u.Name
 		}
+
+		if u.Fallback != "" {
+			if !upstreamNames[u.Fallback] {
+				return fmt.Errorf("fallback %q for upstream %q not found", u.Fallback, u.Name)
+			}
+		}
 	}
 
 	if c.Routing.Timeout <= 0 {
 		c.Routing.Timeout = 120 * time.Second
+	}
+
+	if c.Routing.MaxRetries < 0 {
+		c.Routing.MaxRetries = 0
+	}
+
+	if c.Routing.HealthMaxFailures <= 0 {
+		c.Routing.HealthMaxFailures = 3
+	}
+
+	if c.Routing.HealthCooldown <= 0 {
+		c.Routing.HealthCooldown = 30 * time.Second
 	}
 
 	return nil
