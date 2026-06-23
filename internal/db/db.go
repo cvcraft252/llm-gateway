@@ -50,6 +50,22 @@ func Init(path string) (*DB, error) {
 		return nil, fmt.Errorf("failed to initialize database schema: %w", err)
 	}
 
+	apiKeysQuery := `
+	CREATE TABLE IF NOT EXISTS api_keys (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		key_id TEXT UNIQUE NOT NULL,
+		key_hash TEXT NOT NULL,
+		name TEXT,
+		status TEXT NOT NULL DEFAULT 'active',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		revoked_at DATETIME
+	);`
+
+	if _, err := conn.Exec(apiKeysQuery); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to initialize api_keys schema: %w", err)
+	}
+
 	if err := migrateUpstreamColumn(conn); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("failed to migrate audit_logs schema: %w", err)
