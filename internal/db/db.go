@@ -12,6 +12,7 @@ type DB struct {
 
 type AuditLog struct {
 	Upstream         string
+	KeyID            string
 	Model            string
 	StatusCode       int
 	IsStream         bool
@@ -36,6 +37,7 @@ func Init(path string) (*DB, error) {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		upstream TEXT,
+		key_id TEXT,
 		model TEXT,
 		status_code INTEGER,
 		is_stream INTEGER,
@@ -71,6 +73,11 @@ func Init(path string) (*DB, error) {
 		return nil, fmt.Errorf("failed to migrate audit_logs schema: %w", err)
 	}
 
+	if err := migrateKeyIDColumn(conn); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to migrate audit_logs key_id column: %w", err)
+	}
+
 	return &DB{conn: conn}, nil
 }
 
@@ -102,6 +109,37 @@ func migrateUpstreamColumn(conn *sql.DB) error {
 
 	if _, err := conn.Exec("ALTER TABLE audit_logs ADD COLUMN upstream TEXT"); err != nil {
 		return fmt.Errorf("add upstream column: %w", err)
+	}
+	return nil
+}
+
+// migrateKeyIDColumn adds the key_id column for per-key usage tracking.
+// Idempotent: checks PRAGMA table_info before running ALTER TABLE.
+func migrateKeyIDColumn(conn *sql.DB) error {
+	rows, err := conn.Query("PRAGMA table_info(audit_logs)")
+	if err != nil {
+		return fmt.Errorf("read schema: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return fmt.Errorf("scan schema row: %w", err)
+		}
+		if name == "key_id" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate schema rows: %w", err)
+	}
+
+	if _, err := conn.Exec("ALTER TABLE audit_logs ADD COLUMN key_id TEXT"); err != nil {
+		return fmt.Errorf("add key_id column: %w", err)
 	}
 	return nil
 }
@@ -145,12 +183,13 @@ func (db *DB) InsertAsync(log *AuditLog) {
 		)
 
 		query := `
-		INSERT INTO audit_logs (upstream, model, status_code, is_stream, duration_ms, prompt_tokens, completion_tokens, total_tokens)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?);`
+		INSERT INTO audit_logs (upstream, key_id, model, status_code, is_stream, duration_ms, prompt_tokens, completion_tokens, total_tokens)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`
 
 		_, err := db.conn.Exec(
 			query,
 			l.Upstream,
+			l.KeyID,
 			l.Model,
 			l.StatusCode,
 			streamInt,
