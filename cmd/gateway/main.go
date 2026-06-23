@@ -41,6 +41,8 @@ func main() {
 	defer database.Close()
 	slog.Info("Database initialized successfully")
 
+	keyStore := db.NewKeyStore(database)
+
 	rtr, err := router.New(cfg)
 	if err != nil {
 		slog.Error("Failed to build router", "error", err)
@@ -55,7 +57,7 @@ func main() {
 		slog.Error("Failed to initialize chat handler", "error", err)
 		os.Exit(1)
 	}
-	authedChatHandler := middleware.Auth(cfg, chatHandler)
+	authedChatHandler := middleware.Auth(cfg, keyStore, chatHandler)
 
 	mux.HandleFunc("POST /v1/chat/completions", authedChatHandler)
 

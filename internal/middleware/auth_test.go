@@ -1,15 +1,19 @@
 package middleware_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/cvcraft252/llm-gateway/internal/config"
+	"github.com/cvcraft252/llm-gateway/internal/db"
 	"github.com/cvcraft252/llm-gateway/internal/middleware"
+
+	_ "modernc.org/sqlite"
 )
 
-func TestAuth(t *testing.T) {
+func TestAuth_YAMLKeys(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -109,7 +113,7 @@ func TestAuth(t *testing.T) {
 			cfg := &config.Config{
 				Gateway: config.GatewayConfig{Keys: tt.keys},
 			}
-			handler := middleware.Auth(cfg, next)
+			handler := middleware.Auth(cfg, nil, next)
 
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 			if tt.authHeader != "" {
@@ -133,6 +137,84 @@ func TestAuth(t *testing.T) {
 	}
 }
 
+func TestAuth_YAMLKey_SetsKeyIDInContext(t *testing.T) {
+	t.Parallel()
+
+	var ctxKeyID string
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctxKeyID, _ = r.Context().Value(middleware.CtxKeyKeyID).(string)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{Keys: []string{"gw-yaml-key"}},
+	}
+	handler := middleware.Auth(cfg, nil, next)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer gw-yaml-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if ctxKeyID != "yaml" {
+		t.Errorf("context key_id = %q, want %q for YAML keys", ctxKeyID, "yaml")
+	}
+}
+
+func TestAuth_DBKey(t *testing.T) {
+	t.Parallel()
+
+	database, err := db.Init(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("db.Init: %v", err)
+	}
+	defer database.Close()
+	keyStore := db.NewKeyStore(database)
+
+	fullKey, err := keyStore.Create(context.Background(), "test-app")
+	if err != nil {
+		t.Fatalf("keyStore.Create: %v", err)
+	}
+
+	var ctxKeyID string
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctxKeyID, _ = r.Context().Value(middleware.CtxKeyKeyID).(string)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok": true}`))
+	})
+
+	// No YAML keys, only DB keys
+	cfg := &config.Config{Gateway: config.GatewayConfig{Keys: nil}}
+	handler := middleware.Auth(cfg, keyStore, next)
+
+	t.Run("valid DB key passes and sets key_id in context", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.Header.Set("Authorization", "Bearer "+fullKey)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want 200", rec.Code)
+		}
+		if ctxKeyID != fullKey[:12] {
+			t.Errorf("context key_id = %q, want %q", ctxKeyID, fullKey[:12])
+		}
+	})
+
+	t.Run("revoked DB key is rejected", func(t *testing.T) {
+		_ = keyStore.Revoke(context.Background(), fullKey[:12])
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.Header.Set("Authorization", "Bearer "+fullKey)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want 401 for revoked key", rec.Code)
+		}
+	})
+}
+
 func TestAuth_ErrorResponseContentType(t *testing.T) {
 	t.Parallel()
 
@@ -142,7 +224,7 @@ func TestAuth_ErrorResponseContentType(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("next handler should not be called on auth failure")
 	})
-	handler := middleware.Auth(cfg, next)
+	handler := middleware.Auth(cfg, nil, next)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
@@ -163,7 +245,7 @@ func TestAuth_EmptyKeyList(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("next handler should not be called when no keys configured")
 	})
-	handler := middleware.Auth(cfg, next)
+	handler := middleware.Auth(cfg, nil, next)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.Header.Set("Authorization", "Bearer anything")

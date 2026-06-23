@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cvcraft252/llm-gateway/internal/db"
+	"github.com/cvcraft252/llm-gateway/internal/middleware"
 	"github.com/cvcraft252/llm-gateway/internal/respond"
 	"github.com/cvcraft252/llm-gateway/internal/router"
 )
@@ -98,6 +99,7 @@ type observedBody struct {
 	io.ReadCloser
 	start      time.Time
 	upstream   string
+	keyID      string
 	model      string
 	isStream   bool
 	database   *db.DB
@@ -151,6 +153,7 @@ func (o *observedBody) Close() error {
 	duration := time.Since(o.start)
 	audit := db.AuditLog{
 		Upstream:   o.upstream,
+		KeyID:      o.keyID,
 		Model:      o.model,
 		StatusCode: o.statusCode,
 		IsStream:   o.isStream,
@@ -235,10 +238,15 @@ func NewChatHandler(database *db.DB, rtr *router.Router) (http.HandlerFunc, erro
 			contentType := resp.Header.Get("Content-Type")
 			isStream := strings.Contains(strings.ToLower(contentType), "text/event-stream")
 
+			// Read key_id from the auth middleware via context.
+			// YAML bootstrap keys use "yaml" as their key_id.
+			keyID, _ := resp.Request.Context().Value(middleware.CtxKeyKeyID).(string)
+
 			resp.Body = &observedBody{
 				ReadCloser: resp.Body,
 				start:      time.Now(),
 				upstream:   currentUp.Name,
+				keyID:      keyID,
 				model:      resp.Request.Context().Value(ctxKeyModel).(string),
 				isStream:   isStream,
 				database:   database,
