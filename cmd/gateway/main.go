@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/cvcraft252/llm-gateway/internal/admin"
 	"github.com/cvcraft252/llm-gateway/internal/config"
 	"github.com/cvcraft252/llm-gateway/internal/db"
 	"github.com/cvcraft252/llm-gateway/internal/handler"
@@ -60,6 +61,12 @@ func main() {
 	authedChatHandler := middleware.Auth(cfg, keyStore, chatHandler)
 
 	mux.HandleFunc("POST /v1/chat/completions", authedChatHandler)
+
+	// Admin endpoints for key management (separate auth from gateway keys)
+	adminHandler := admin.New(keyStore, cfg.Gateway.AdminKeys)
+	mux.HandleFunc("POST /v1/admin/keys", adminHandler.AuthMiddleware(adminHandler.CreateKey))
+	mux.HandleFunc("GET /v1/admin/keys", adminHandler.AuthMiddleware(adminHandler.ListKeys))
+	mux.HandleFunc("DELETE /v1/admin/keys/{key_id}", adminHandler.AuthMiddleware(adminHandler.RevokeKey))
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

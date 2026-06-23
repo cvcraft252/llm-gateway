@@ -4,6 +4,8 @@ server:
 gateway:
   keys:
     - gw-key-123456 # Custom API keys permitted to access this gateway
+  admin_keys:
+    - admin-secret-key # Keys for admin endpoints (key management, audit). Separate from gateway keys.
 
 # One or more upstream providers. The gateway routes each request to the
 # upstream that declares the requested model. A model may belong to only one
